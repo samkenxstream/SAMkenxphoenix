@@ -47,7 +47,7 @@ defmodule Phoenix.CodeReloader.Server do
             File.rm_rf(priv_path)
             Mix.Project.build_structure()
           else
-            Logger.warn(
+            Logger.warning(
               "Phoenix is unable to create symlinks. Phoenix' code reloader will run " <>
                 "considerably faster if symlinks are allowed." <> os_symlink(:os.type())
             )
@@ -165,17 +165,26 @@ defmodule Phoenix.CodeReloader.Server do
     end
   end
 
+  if Version.match?(System.version(), "< 1.15.0-dev") do
+    defp purge_protocols(path) do
+      purge_modules(path)
+      Code.delete_path(path)
+    end
+  else
+    defp purge_protocols(_path), do: :ok
+  end
+
   defp mix_compile({:module, Mix.Task}, compilers, apps_to_reload, timestamp) do
     config = Mix.Project.config()
     path = Mix.Project.consolidation_path(config)
 
+    # TODO: Remove this conditional when requiring Elixir v1.15+
     if config[:consolidate_protocols] do
-      purge_modules(path)
-      Code.delete_path(path)
+      purge_protocols(path)
     end
 
-    mix_compile_deps(Mix.Dep.cached(), apps_to_reload, compilers, timestamp)
-    mix_compile_project(config[:app], apps_to_reload, compilers, timestamp)
+    mix_compile_deps(Mix.Dep.cached(), apps_to_reload, compilers, timestamp, path)
+    mix_compile_project(config[:app], apps_to_reload, compilers, timestamp, path)
 
     if config[:consolidate_protocols] do
       Code.prepend_path(path)
@@ -191,23 +200,23 @@ defmodule Phoenix.CodeReloader.Server do
             "in such environments"
   end
 
-  defp mix_compile_deps(deps, apps_to_reload, compilers, timestamp) do
+  defp mix_compile_deps(deps, apps_to_reload, compilers, timestamp, path) do
     for dep <- deps, dep.app in apps_to_reload do
       Mix.Dep.in_dependency(dep, fn _ ->
-        mix_compile_unless_stale_config(compilers, timestamp)
+        mix_compile_unless_stale_config(compilers, timestamp, path)
       end)
     end
   end
 
-  defp mix_compile_project(nil, _, _, _), do: :ok
+  defp mix_compile_project(nil, _, _, _, _), do: :ok
 
-  defp mix_compile_project(app, apps_to_reload, compilers, timestamp) do
+  defp mix_compile_project(app, apps_to_reload, compilers, timestamp, path) do
     if app in apps_to_reload do
-      mix_compile_unless_stale_config(compilers, timestamp)
+      mix_compile_unless_stale_config(compilers, timestamp, path)
     end
   end
 
-  defp mix_compile_unless_stale_config(compilers, timestamp) do
+  defp mix_compile_unless_stale_config(compilers, timestamp, path) do
     manifests = Mix.Tasks.Compile.Elixir.manifests()
     configs = Mix.Project.config_files()
     config = Mix.Project.config()
@@ -220,7 +229,7 @@ defmodule Phoenix.CodeReloader.Server do
           purge_modules(Path.join(Mix.Project.app_path(config), "ebin"))
         end
 
-        mix_compile(compilers, config)
+        mix_compile(compilers, config, path)
 
       files ->
         raise """
@@ -234,7 +243,7 @@ defmodule Phoenix.CodeReloader.Server do
     end
   end
 
-  defp mix_compile(compilers, config) do
+  defp mix_compile(compilers, config, consolidation_path) do
     all = config[:compilers] || Mix.compilers()
 
     compilers =
@@ -246,15 +255,14 @@ defmodule Phoenix.CodeReloader.Server do
     # We call build_structure mostly for Windows so new
     # assets in priv are copied to the build directory.
     Mix.Project.build_structure(config)
-    results = Enum.map(compilers, &Mix.Task.run("compile.#{&1}", []))
+    args = ["--purge-consolidation-path-if-stale", consolidation_path]
+    result = run_compilers(compilers, args, [])
 
-    # Results are either {:ok, _} | {:error, _}, {:noop, _} or
-    # :ok | :error | :noop. So we use proplists to do the unwrapping.
     cond do
-      :proplists.get_value(:error, results, false) ->
+      result == :error ->
         exit({:shutdown, 1})
 
-      :proplists.get_value(:ok, results, false) && config[:consolidate_protocols] ->
+      result == :ok && config[:consolidate_protocols] ->
         Mix.Task.reenable("compile.protocols")
         Mix.Task.run("compile.protocols", [])
         :ok
@@ -289,4 +297,38 @@ defmodule Phoenix.CodeReloader.Server do
       Process.exit(proxy_gl, :kill)
     end
   end
+
+  defp run_compilers([compiler | compilers], args, acc) do
+    with {status, diagnostics} <- Mix.Task.run("compile.#{compiler}", args) do
+      # Diagnostics are written to stderr and therefore not captured,
+      # so we print them to the group leader here
+      Enum.each(diagnostics, &print_diagnostic/1)
+      {status, diagnostics}
+    end
+    |> case do
+      :error -> :error
+      {:error, _} -> :error
+      result -> run_compilers(compilers, args, [result | acc])
+    end
+  end
+
+  defp run_compilers([], _args, results) do
+    if :proplists.get_value(:ok, results, false) do
+      :ok
+    else
+      :noop
+    end
+  end
+
+  defp print_diagnostic(%{severity: :error, message: "**" <> _ = message}) do
+    IO.write("\n#{message}\n")
+  end
+
+  defp print_diagnostic(%{severity: severity, message: message, file: file, position: position}) do
+    IO.write("\n#{severity}: #{message}\n  #{Path.relative_to_cwd(file)}#{position(position)}\n")
+  end
+
+  defp position({line, col}), do: ":#{line}:#{col}"
+  defp position(line) when is_integer(line) and line > 0, do: ":#{line}"
+  defp position(_), do: ""
 end

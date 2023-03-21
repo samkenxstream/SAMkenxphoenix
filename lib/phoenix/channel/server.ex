@@ -18,14 +18,14 @@ defmodule Phoenix.Channel.Server do
   def join(socket, channel, message, opts) do
     %{topic: topic, payload: payload, ref: ref, join_ref: join_ref} = message
 
-    starter = opts[:starter] || &PoolSupervisor.start_child/4
+    starter = opts[:starter] || &PoolSupervisor.start_child/3
     assigns = Map.merge(socket.assigns, Keyword.get(opts, :assigns, %{}))
     socket = %{socket | topic: topic, channel: channel, join_ref: join_ref || ref, assigns: assigns}
     ref = make_ref()
     from = {self(), ref}
     child_spec = channel.child_spec({socket.endpoint, from})
-    
-    case starter.(socket.endpoint, socket.handler, from, child_spec) do
+
+    case starter.(socket, from, child_spec) do
       {:ok, pid} ->
         send(pid, {Phoenix.Channel, payload, from, socket})
         mon_ref = Process.monitor(pid)
@@ -322,6 +322,14 @@ defmodule Phoenix.Channel.Server do
   end
 
   def handle_info(
+        %Broadcast{event: "phx_drain"},
+        %{transport_pid: transport_pid} = socket
+      ) do
+    send(transport_pid, :socket_drain)
+    {:stop, {:shutdown, :draining}, socket}
+  end
+
+  def handle_info(
         %Broadcast{topic: topic, event: event, payload: payload},
         %Socket{topic: topic} = socket
       ) do
@@ -345,7 +353,7 @@ defmodule Phoenix.Channel.Server do
       |> socket.channel.handle_info(socket)
       |> handle_result(:handle_info)
     else
-      warn_unexpected_msg(:handle_info, 2, msg)
+      warn_unexpected_msg(:handle_info, 2, msg, channel)
       {:noreply, socket}
     end
   end
@@ -533,7 +541,7 @@ defmodule Phoenix.Channel.Server do
     """
   end
 
-  defp warn_unexpected_msg(fun, arity, msg) do
+  defp warn_unexpected_msg(fun, arity, msg, channel) do
     proc =
       case Process.info(self(), :registered_name) do
         {_, []} -> self()
@@ -542,7 +550,7 @@ defmodule Phoenix.Channel.Server do
 
     :error_logger.warning_msg(
       ~c"~p ~p received unexpected message in #{fun}/#{arity}: ~p~n",
-      [__MODULE__, proc, msg]
+      [channel, proc, msg]
     )
   end
 end
